@@ -35,8 +35,12 @@
 static int selinux_enabled = -1;
 #endif
 
+#ifdef FEAT_XATTR
+# include <sys/xattr.h>
+#endif
+
 #ifdef HAVE_SMACK
-# include <attr/xattr.h>
+# include <sys/xattr.h>
 # include <linux/xattr.h>
 # ifndef SMACK_LABEL_LEN
 #  define SMACK_LABEL_LEN 1024
@@ -1858,7 +1862,7 @@ ex_xrestore(exarg_T *eap)
     static int
 test_x11_window(Display *dpy)
 {
-    int			(*old_handler)();
+    int			(*old_handler)(Display*, XErrorEvent*);
     XTextProperty	text_prop;
 
     old_handler = XSetErrorHandler(x_error_check);
@@ -2316,12 +2320,11 @@ mch_settitle(char_u *title, char_u *icon)
 #ifdef FEAT_X11
     if (get_x11_windis() == OK)
 	type = 1;
-#else
-# if defined(FEAT_GUI_PHOTON) \
+#endif
+#if defined(FEAT_GUI_PHOTON) \
     || defined(FEAT_GUI_GTK) || defined(FEAT_GUI_HAIKU)
     if (gui.in_use)
 	type = 1;
-# endif
 #endif
 
     /*
@@ -2696,6 +2699,9 @@ mch_FullName(
     if ((force || !mch_isFullName(fname))
 	    && ((p = vim_strrchr(fname, '/')) == NULL || p != fname))
     {
+	if (p == NULL && STRCMP(fname, "..") == 0)
+	    // Handle ".." without path separators.
+	    p = fname + 2;
 	/*
 	 * If the file name has a path, change to that directory for a moment,
 	 * and then get the directory (and get back to where we were).
@@ -2704,7 +2710,7 @@ mch_FullName(
 	if (p != NULL)
 	{
 	    if (STRCMP(p, "/..") == 0)
-		// for "/path/dir/.." include the "/.."
+		// For "/path/dir/.." include the "/..".
 		p += 3;
 
 #ifdef HAVE_FCHDIR
@@ -3043,6 +3049,11 @@ mch_copy_sec(char_u *from_file, char_u *to_file)
     if (from_file == NULL)
 	return;
 
+    size = listxattr((char *)from_file, NULL, 0);
+    // not supported or no attributes to copy
+    if (size <= 0)
+	return;
+
     for (index = 0 ; index < (int)(sizeof(smack_copied_attributes)
 			      / sizeof(smack_copied_attributes)[0]) ; index++)
     {
@@ -3095,6 +3106,97 @@ mch_copy_sec(char_u *from_file, char_u *to_file)
     }
 }
 #endif // HAVE_SMACK
+
+#ifdef FEAT_XATTR
+/*
+ * Copy extended attributes from_file to to_file
+ */
+    void
+mch_copy_xattr(char_u *from_file, char_u *to_file)
+{
+    char	*xattr_buf;
+    ssize_t	size;
+    ssize_t	tsize;
+    ssize_t	keylen, vallen, max_vallen = 0;
+    char	*key;
+    char	*val = NULL;
+    char	*errmsg = NULL;
+
+    if (from_file == NULL)
+	return;
+
+    // get the length of the extended attributes
+    size = listxattr((char *)from_file, NULL, 0);
+    // not supported or no attributes to copy
+    if (size <= 0)
+	return;
+    xattr_buf = (char*)alloc(size);
+    if (xattr_buf == NULL)
+	return;
+    size = listxattr((char *)from_file, xattr_buf, size);
+    tsize = size;
+
+    errno = 0;
+
+    for (int round = 0; round < 2; round++)
+    {
+
+	key = xattr_buf;
+	if (round == 1)
+	    size = tsize;
+
+	while (size > 0)
+	{
+	    vallen = getxattr((char *)from_file, key,
+		    val, round ? max_vallen : 0);
+	    // only set the attribute in the second round
+	    if (vallen >= 0 && round &&
+		setxattr((char *)to_file, key, val, vallen, 0) == 0)
+		;
+	    else if (errno)
+	    {
+		switch (errno)
+		{
+		    case E2BIG:
+			errmsg = e_xattr_e2big;
+			goto error_exit;
+		    case ENOTSUP:
+		    case EACCES:
+		    case EPERM:
+			break;
+		    case ERANGE:
+			errmsg = e_xattr_erange;
+			goto error_exit;
+		    default:
+			errmsg = e_xattr_other;
+			goto error_exit;
+		}
+	    }
+
+	    if (round == 0 && vallen > max_vallen)
+		max_vallen = vallen;
+
+	    // add one for terminating null
+	    keylen = STRLEN(key) + 1;
+	    size -= keylen;
+	    key += keylen;
+	}
+	if (round)
+	    break;
+
+	val = (char*)alloc(max_vallen + 1);
+	if (val == NULL)
+	    goto error_exit;
+
+    }
+error_exit:
+    vim_free(xattr_buf);
+    vim_free(val);
+
+    if (errmsg != NULL)
+	emsg(_(errmsg));
+}
+#endif
 
 /*
  * Return a pointer to the ACL of file "fname" in allocated memory.
@@ -3667,7 +3769,8 @@ mch_settmode(tmode_T tmode)
     {
 	// ~ICRNL enables typing ^V^M
 	// ~IXON disables CTRL-S stopping output, so that it can be mapped.
-	tnew.c_iflag &= ~(ICRNL | IXON);
+	tnew.c_iflag &= ~(ICRNL |
+		(T_XON == NULL || *T_XON == NUL ? IXON : 0));
 	tnew.c_lflag &= ~(ICANON | ECHO | ISIG | ECHOE
 # if defined(IEXTEN)
 		    | IEXTEN	    // IEXTEN enables typing ^V on SOLARIS
@@ -4245,6 +4348,43 @@ mch_get_shellsize(void)
     return OK;
 }
 
+/*
+ * Try to get the current terminal cell size.
+ * On failure, returns -1x-1
+ */
+    void
+mch_calc_cell_size(struct cellsize *cs_out)
+{
+   // get current tty size.
+   struct winsize ws;
+   int fd = 1;
+   int retval = -1;
+   retval = ioctl(fd, TIOCGWINSZ, &ws);
+
+#ifdef FEAT_EVAL
+   ch_log(NULL, "ioctl(TIOCGWINSZ) %s", retval == 0 ? "success" : "failed");
+#endif
+
+   if (retval == -1 || ws.ws_col == 0 || ws.ws_row == 0)
+   {
+       cs_out->cs_xpixel = -1;
+       cs_out->cs_ypixel = -1;
+       return;
+   }
+
+   // calculate parent tty's pixel per cell.
+   int x_cell_size = ws.ws_xpixel / ws.ws_col;
+   int y_cell_size = ws.ws_ypixel / ws.ws_row;
+
+   // calculate current tty's pixel
+   cs_out->cs_xpixel = x_cell_size;
+   cs_out->cs_ypixel = y_cell_size;
+
+#ifdef FEAT_EVAL
+   ch_log(NULL, "Got cell pixel size with TIOCGWINSZ: %d x %d", x_cell_size, y_cell_size);
+#endif
+}
+
 #if defined(FEAT_TERMINAL) || defined(PROTO)
 /*
  * Report the windows size "rows" and "cols" to tty "fd".
@@ -4264,8 +4404,23 @@ mch_report_winsize(int fd, int rows, int cols)
 
     ws.ws_col = cols;
     ws.ws_row = rows;
-    ws.ws_xpixel = cols * 5;
-    ws.ws_ypixel = rows * 10;
+
+    // calcurate and set tty pixel size
+    struct cellsize cs;
+    mch_calc_cell_size(&cs);
+
+    if (cs.cs_xpixel == -1)
+    {
+        // failed get pixel size.
+        ws.ws_xpixel = 0;
+        ws.ws_ypixel = 0;
+    }
+    else
+    {
+        ws.ws_xpixel = cols * cs.cs_xpixel;
+        ws.ws_ypixel = rows * cs.cs_ypixel;
+    }
+
     retval = ioctl(tty_fd, TIOCSWINSZ, &ws);
     ch_log(NULL, "ioctl(TIOCSWINSZ) %s", retval == 0 ? "success" : "failed");
 # elif defined(TIOCSSIZE)
@@ -5660,8 +5815,11 @@ mch_job_start(char **argv, job_T *job, jobopt_T *options, int is_terminal)
 	    goto failed;
 	}
     }
+    // only create a pipe for the error fd, when either a callback has been setup
+    // or pty is not used (e.g. terminal uses pty by default)
     else if (!use_out_for_err && !use_null_for_err
-				      && pty_master_fd < 0 && pipe(fd_err) < 0)
+		&& (pty_master_fd < 0 || (options->jo_set & JO_ERR_CALLBACK))
+			    && pipe(fd_err) < 0)
 	goto failed;
 
     if (!use_null_for_in || !use_null_for_out || !use_null_for_err)
@@ -6071,7 +6229,7 @@ mch_signal_job(job_T *job, char_u *how)
     else if (STRCMP(how, "winch") == 0)
 	sig = SIGWINCH;
 #endif
-    else if (isdigit(*how))
+    else if (SAFE_isdigit(*how))
 	sig = atoi((char *)how);
     else
 	return FAIL;
@@ -6701,14 +6859,17 @@ mch_expand_wildcards(
 #define STYLE_GLOB	1	// use "glob", for csh
 #define STYLE_VIMGLOB	2	// use "vimglob", for Posix sh
 #define STYLE_PRINT	3	// use "print -N", for zsh
-#define STYLE_BT	4	// `cmd` expansion, execute the pattern
-				// directly
+#define STYLE_BT	4	// `cmd` expansion, execute the pattern directly
+#define STYLE_GLOBSTAR	5	// use extended shell glob for bash (this uses extended
+				// globbing functionality using globstar, needs bash > 4)
     int		shell_style = STYLE_ECHO;
     int		check_spaces;
     static int	did_find_nul = FALSE;
     int		ampersand = FALSE;
 		// vimglob() function to define for Posix shell
     static char *sh_vimglob_func = "vimglob() { while [ $# -ge 1 ]; do echo \"$1\"; shift; done }; vimglob >";
+		// vimglob() function with globstar setting enabled, only for bash >= 4.X
+    static char *sh_globstar_opt = "[[ ${BASH_VERSINFO[0]} -ge 4 ]] && shopt -s globstar; ";
 
     *num_file = 0;	// default: no files found
     *file = NULL;
@@ -6755,6 +6916,8 @@ mch_expand_wildcards(
      *	    If we use *zsh, "print -N" will work better than "glob".
      * STYLE_VIMGLOB:	NL separated
      *	    If we use *sh*, we define "vimglob()".
+     * STYLE_GLOBSTAR:	NL separated
+     *	    If we use *bash*, we define "vimglob() and enable globstar option".
      * STYLE_ECHO:	space separated.
      *	    A shell we don't know, stay safe and use "echo".
      */
@@ -6769,9 +6932,13 @@ mch_expand_wildcards(
 	else if (STRCMP(p_sh + len - 3, "zsh") == 0)
 	    shell_style = STYLE_PRINT;
     }
-    if (shell_style == STYLE_ECHO && strstr((char *)gettail(p_sh),
-								"sh") != NULL)
-	shell_style = STYLE_VIMGLOB;
+    if (shell_style == STYLE_ECHO)
+    {
+       if (strstr((char *)gettail(p_sh), "bash") != NULL)
+	    shell_style = STYLE_GLOBSTAR;
+       else if (strstr((char *)gettail(p_sh), "sh") != NULL)
+	    shell_style = STYLE_VIMGLOB;
+    }
 
     // Compute the length of the command.  We need 2 extra bytes: for the
     // optional '&' and for the NUL.
@@ -6779,6 +6946,9 @@ mch_expand_wildcards(
     len = STRLEN(tempname) + 29;
     if (shell_style == STYLE_VIMGLOB)
 	len += STRLEN(sh_vimglob_func);
+    else if (shell_style == STYLE_GLOBSTAR)
+	len += STRLEN(sh_vimglob_func)
+	     + STRLEN(sh_globstar_opt);
 
     for (i = 0; i < num_pat; ++i)
     {
@@ -6847,6 +7017,11 @@ mch_expand_wildcards(
 	    STRCAT(command, "print -N >");
 	else if (shell_style == STYLE_VIMGLOB)
 	    STRCAT(command, sh_vimglob_func);
+	else if (shell_style == STYLE_GLOBSTAR)
+	{
+	    STRCAT(command, sh_globstar_opt);
+	    STRCAT(command, sh_vimglob_func);
+	}
 	else
 	    STRCAT(command, "echo >");
     }
@@ -7031,7 +7206,9 @@ mch_expand_wildcards(
 	}
     }
     // file names are separated with NL
-    else if (shell_style == STYLE_BT || shell_style == STYLE_VIMGLOB)
+    else if (shell_style == STYLE_BT ||
+	    shell_style == STYLE_VIMGLOB ||
+	    shell_style == STYLE_GLOBSTAR)
     {
 	buffer[len] = NUL;		// make sure the buffer ends in NUL
 	p = buffer;
@@ -7112,7 +7289,7 @@ mch_expand_wildcards(
 	(*file)[i] = p;
 	// Space or NL separates
 	if (shell_style == STYLE_ECHO || shell_style == STYLE_BT
-					      || shell_style == STYLE_VIMGLOB)
+		|| shell_style == STYLE_VIMGLOB || shell_style == STYLE_GLOBSTAR)
 	{
 	    while (!(shell_style == STYLE_ECHO && *p == ' ')
 						   && *p != '\n' && *p != NUL)
@@ -7376,7 +7553,19 @@ gpm_open(void)
 	return 1; // succeed
     }
     if (gpm_fd == -2)
+    {
 	Gpm_Close(); // We don't want to talk to xterm via gpm
+
+	// Gpm_Close fails to properly restore the WINCH and TSTP handlers,
+	// leading to Vim ignoring resize signals. We have to re-initialize
+	// these handlers again here.
+# ifdef SIGWINCH
+	mch_signal(SIGWINCH, sig_winch);
+# endif
+# ifdef SIGTSTP
+	mch_signal(SIGTSTP, restricted ? SIG_IGN : sig_tstp);
+# endif
+    }
     return 0;
 }
 
@@ -7591,6 +7780,37 @@ sig_sysmouse SIGDEFARG(sigarg)
 }
 #endif // FEAT_SYSMOUSE
 
+/*
+ * Fill the buffer 'buf' with 'len' random bytes.
+ * Returns FAIL if the OS PRNG is not available or something went wrong.
+ */
+    int
+mch_get_random(char_u *buf, int len)
+{
+    static int dev_urandom_state = NOTDONE;
+
+    if (dev_urandom_state == FAIL)
+	return FAIL;
+
+    int fd = open("/dev/urandom", O_RDONLY);
+
+    // Attempt reading /dev/urandom.
+    if (fd == -1)
+	dev_urandom_state = FAIL;
+    else if (read(fd, buf, len) == len)
+    {
+	dev_urandom_state = OK;
+	close(fd);
+    }
+    else
+    {
+	dev_urandom_state = FAIL;
+	close(fd);
+    }
+
+    return dev_urandom_state;
+}
+
 #if defined(FEAT_LIBCALL) || defined(PROTO)
 typedef char_u * (*STRPROCSTR)(char_u *);
 typedef char_u * (*INTPROCSTR)(int);
@@ -7781,9 +8001,9 @@ setup_term_clip(void)
     open_app_context();
     if (app_context != NULL && xterm_Shell == (Widget)0)
     {
-	int (*oldhandler)();
+	int (*oldhandler)(Display*, XErrorEvent*);
 # if defined(USING_SETJMP)
-	int (*oldIOhandler)();
+	int (*oldIOhandler)(Display*);
 # endif
 # ifdef ELAPSED_FUNC
 	elapsed_T start_tv;

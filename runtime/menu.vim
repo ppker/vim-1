@@ -122,7 +122,7 @@ enddef
 " File menu
 an 10.310 &File.&Open\.\.\.<Tab>:e		:browse confirm e<CR>
 an 10.320 &File.Sp&lit-Open\.\.\.<Tab>:sp	:browse sp<CR>
-an 10.320 &File.Open\ Tab\.\.\.<Tab>:tabnew	:browse tabnew<CR>
+an 10.320 &File.Open\ &Tab\.\.\.<Tab>:tabnew	:browse tabnew<CR>
 an 10.325 &File.&New<Tab>:enew			:confirm enew<CR>
 an <silent> 10.330 &File.&Close<Tab>:close
 	\ :if winheight(2) < 0 && tabpagewinnr(2) == 0 <Bar>
@@ -1137,7 +1137,7 @@ else
   endif
   tmenu ToolBar.LoadSesn	Choose a session to load
   tmenu ToolBar.SaveSesn	Save current session
-  tmenu ToolBar.RunScript	Choose a Vim Script to run
+  tmenu ToolBar.RunScript	Choose a Vim script to run
   tmenu ToolBar.Make		Make current project (:make)
   tmenu ToolBar.RunCtags	Build tags in current directory tree (!ctags -R .)
   tmenu ToolBar.TagJump		Jump to tag under cursor
